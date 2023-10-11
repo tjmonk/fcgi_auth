@@ -746,6 +746,12 @@ static int ProcessLoginQuery( FCGIAuthState *pState, char *query )
         {
             result = ErrorResponse( 401, "Unauthorized");
         }
+/*
+        printf("username %s password %s reference %s session %s\n",
+            username, password, reference, session );
+
+        printf("result = %d\", result");
+*/
     }
 
     return result;
