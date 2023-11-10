@@ -53,6 +53,7 @@ SOFTWARE.
 #include <syslog.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <ctype.h>
 #include <sessionmgr/sessionmgr.h>
 #include <fcgi_stdio.h>
@@ -101,6 +102,19 @@ typedef struct _fcgi_handler
     HandlerFunction fn;
 } FCGIHandler;
 
+/*! credential type */
+typedef enum credType
+{
+    /*! invalid/unsupported credentials */
+    CRED_TYPE_INVALID = 0,
+
+    /*! basic credentials */
+    CRED_TYPE_BASIC = 1,
+
+    /*! bearer credentials */
+    CRED_TYPE_BEARER = 2
+} CredentialsType;
+
 /*==============================================================================
         Private function declarations
 ==============================================================================*/
@@ -135,7 +149,7 @@ static int ErrorResponse( int status,  char *description );
 static int AuthSessionResponse( char *session );
 
 static char* base64_decode(char* cipher, char *plain, size_t len);
-static char *GetCreds( char *buf, size_t len );
+static char *CheckCredentials( CredentialsType *type );
 
 /*==============================================================================
         Private file scoped variables
@@ -151,6 +165,8 @@ FCGIHandler methodHandlers[] =
 
 /* FCGI Vars State object */
 FCGIAuthState state;
+
+int log_fd;
 
 /*==============================================================================
         Private function definitions
@@ -702,115 +718,156 @@ static int ProcessQuery( FCGIAuthState *pState, char *query )
 static int ProcessLoginQuery( FCGIAuthState *pState, char *query )
 {
     int result = EINVAL;
-    char *authorization;
-    char *creds = NULL;
     char *p;
-    char buf[BUFSIZ];
-    char *username;
-    char *password;
+    char *username = NULL;
+    char *password = NULL;
     char *reference;
     char session[SESSION_ID_LEN+1];
+    CredentialsType credType;
+    char *token = NULL;
+    char b64out[256];
 
     if ( ( pState != NULL ) &&
          ( query != NULL ) )
     {
-        creds = GetCreds( buf, BUFSIZ );
+        /* get the connection reference (IP address) */
         reference = getenv("REMOTE_ADDR");
-
-        if ( ( creds != NULL ) &&
-             ( reference != NULL ) )
+        if ( reference != NULL )
         {
-            username = creds;
-            p = strchr(creds, ':');
-            if ( p != NULL )
+            /* check HTTP_AUTHORIZATION header for login credentials */
+            token = CheckCredentials( &credType );
+            if ( token != NULL )
             {
-                *p = 0;
-                password = p+1;
-            }
+                /* check for either a bearer token or a basic auth token */
+                if ( credType == CRED_TYPE_BEARER )
+                {
+                    /* create a new session from the specified
+                       bearer token */
+                    result = SESSIONMGR_NewSessionFromToken( token,
+                                                             reference,
+                                                             session,
+                                                             sizeof session );
+                }
+                else if ( credType == CRED_TYPE_BASIC )
+                {
+                    /* base64 decode the basic auth token */
+                    memset( b64out, 0, sizeof( b64out) );
 
-            result = SESSIONMGR_NewSession( username,
-                                            password,
-                                            reference,
-                                            session,
-                                            sizeof(session) );
-            if ( result == EOK )
-            {
-                result = AuthSessionResponse( session );
+                    p = base64_decode( token, b64out, sizeof(b64out) );
+                    if ( p != NULL )
+                    {
+                        /* get a pointer to the username */
+                        username = b64out;
+                        p = strchr( b64out, ':' );
+                        if ( p != NULL )
+                        {
+                            /* get a pointer to the password */
+                            *p = 0;
+                            password = p+1;
+                        }
+
+                        /* create a new session from the basic auth
+                           username and password */
+                        result = SESSIONMGR_NewSession( username,
+                                                        password,
+                                                        reference,
+                                                        session,
+                                                        sizeof(session) );
+                    }
+                }
+                else
+                {
+                    result = EINVAL;
+                }
             }
-            else
-            {
-                result = ErrorResponse( 401, "Unauthorized");
-            }
+        }
+
+        if ( result == EOK )
+        {
+            result = AuthSessionResponse( session );
         }
         else
         {
             result = ErrorResponse( 401, "Unauthorized");
         }
-/*
-        printf("username %s password %s reference %s session %s\n",
-            username, password, reference, session );
-
-        printf("result = %d\", result");
-*/
     }
 
     return result;
 }
 
 /*============================================================================*/
-/*  GetCreds                                                                  */
+/*  CheckCredentials                                                          */
 /*!
-    Get basic auth login credentials
+    Check and get the authentication credentials
 
-    The GetCreds function extracts the basic auth login credentials
-    from the HTTP_AUTHORIZATION header in the current request.
+    The CheckCredentials function checks the type of credentials
+    we have and extracts them from the HTTP_AUTHORIZATION header.
+
+    @param[in,out]
+        type
+            pointer to storage for a CredentialsType
+
+    @param[in,out]
+        creds
+            pointer to a storage location for the credentials pointer
 
     @param[in,out]
         buf
-            pointer to a buffer to store the decoded 'user:pass' credentials
+            pointer to a storage location for the credentials
 
     @param[in]
         len
-            size of the buffer to store the credentials
+            length of the storage location for the credentials
 
-    @retval pointer to the decoded credentials in the form user:pass
-    @retval NULL if the credentials could not be decoded
+    @retval EOK credentials identified and extracted
+    @retval EINVAL invalid arguments or credentials
 
 ==============================================================================*/
-static char *GetCreds( char *buf, size_t len )
+static char *CheckCredentials( CredentialsType *type )
 {
-    char *authorization = NULL;
-    char *creds = NULL;
-    char *p = NULL;
+    char *authorization;
+    char *token = NULL;
+    char authtype[10];
+    size_t len;
+    size_t i;
 
-    if ( ( buf != NULL ) &&
-         ( len > 0 ) )
+    if ( type != NULL )
     {
         authorization = getenv( "HTTP_AUTHORIZATION");
         if ( authorization != NULL )
         {
-            p = strstr( authorization, "Basic ");
-            if ( p != NULL )
+            len = strlen( authorization );
+            if ( len > 7 )
             {
-                creds = p+6;
+                len = 7;
+            }
+
+            /* convert the first (up to) 7 characters to lower case
+               to make comparison easier */
+            for( i = 0; i < len ; i++ )
+            {
+                authtype[i] = tolower( authorization[i] );
+            }
+            authtype[i] = 0;
+
+            if ( strstr( authtype, "basic" ) == authtype )
+            {
+                *type = CRED_TYPE_BASIC;
+                token = &authorization[6];
+            }
+            else if ( strstr ( authtype, "bearer" ) == authtype )
+            {
+                *type = CRED_TYPE_BEARER;
+                token = &authorization[7];
             }
             else
             {
-                p = strstr( authorization, "basic ");
-                if ( p != NULL )
-                {
-                    creds = p+6;
-                }
-            }
-
-            if ( creds != NULL )
-            {
-                creds = base64_decode( creds, buf, len );
+                *type = CRED_TYPE_INVALID;
             }
         }
     }
 
-    return creds;
+    return token;
 }
 
 /*============================================================================*/
